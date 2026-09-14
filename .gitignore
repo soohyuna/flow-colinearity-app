@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Downloaded / regenerable caches -- rebuilt automatically on first run
+cache/
+data/*.csv
+
+# Cytek's reference data is fetched from spectrum.cytekbio.com at first launch rather
+# than redistributed here (see cytek_library.py). data/ itself stays via .gitkeep.
+
+# Per-user dye uploads and digitised signatures -- personal, not part of the app
+custom_dyes/*
+!custom_dyes/.gitkeep
+
+# Runtime state written by the launchers
+.server.pid
+.server.log
+
+# macOS
+.DS_Store
