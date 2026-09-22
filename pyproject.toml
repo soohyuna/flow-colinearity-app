@@ -1,0 +1,18 @@
+[project]
+name = "flow-colinearity-app"
+version = "0.2.0"
+description = "Spectral overlap explorer for fluorophore panels on a Cytek Aurora 5L."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "altair>=5.4",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pillow>=10",
+    "scipy>=1.11",
+    "streamlit>=1.50,<2",
+]
+
+[tool.uv]
+package = false

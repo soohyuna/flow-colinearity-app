@@ -7,15 +7,27 @@ and detector channels (Cytek Aurora/Northern Lights 5L config is built in).
 
 ## Run it
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
+
 ```bash
 git clone https://github.com/soohyuna/flow-colinearity-app.git
 cd flow-colinearity-app
-python3 -m pip install --user -r requirements.txt
-python3 run_app.py
+uv sync
+uv run python run_app.py
 ```
 
-Then open the URL it prints (http://localhost:8600 by default). Leave the terminal
-running; Ctrl+C stops the server.
+`uv sync` creates `.venv` from `uv.lock` and installs the locked dependencies.
+`uv run` uses that environment. Python 3.13 is required (`requires-python` in
+`pyproject.toml`).
+
+Open the URL it prints (http://localhost:8600 by default). Leave the terminal
+running. Ctrl+C stops the server.
+
+To check the chart helpers without starting the server:
+
+```bash
+uv run python tests/test_spectra_view.py
+```
 
 **On a Mac, double-click instead:** `Start Flow Colinearity.command` opens a Terminal
 window, starts the server, and opens your browser. `Flow Colinearity.app` does the same
@@ -30,41 +42,145 @@ Clone it somewhere plain like `~/flow-colinearity-app/`, not under `~/Downloads`
 `~/Desktop` or `~/Documents`: macOS TCC-protects those folders, and some launchers cannot
 read files there.
 
+## Architecture
+
+The page in `app.py` is the only place that talks to Streamlit. Scoring stays in
+plain functions so a chart can explain a number without changing how the number
+is computed.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#eef2ff',
+  'primaryTextColor': '#1e293b',
+  'primaryBorderColor': '#4f46e5',
+  'lineColor': '#64748b',
+  'edgeLabelBackground': '#ffffff',
+  'clusterBkg': '#f8fafc',
+  'clusterBorder': '#64748b'
+}}}%%
+flowchart TB
+  subgraph interface [Interface]
+    app["app.py"]
+    charts["spectra_view.py"]
+  end
+  subgraph scoring [Scoring]
+    coli["colinearity.py"]
+    rec["recommend.py"]
+  end
+  subgraph spectra [Spectra sources]
+    cytek["cytek_library.py"]
+    fpbase["fpbase_client.py"]
+    custom["custom_store.py"]
+    image["spectra_image.py"]
+  end
+  app --> charts
+  app --> coli
+  app --> rec
+  charts --> coli
+  rec --> coli
+  app --> cytek
+  app --> fpbase
+  app --> custom
+  app --> image
+  cytek --> disk[("data CSVs")]
+  fpbase --> api["FPbase GraphQL"]
+  custom --> dyes[("custom_dyes")]
+  cytek -.-> viewer["spectrum.cytekbio.com"]
+
+  style app fill:#eef2ff,stroke:#4f46e5,color:#1e293b
+  style charts fill:#eef2ff,stroke:#4f46e5,color:#1e293b
+  style coli fill:#f1f5f9,stroke:#64748b,color:#1e293b
+  style rec fill:#f1f5f9,stroke:#64748b,color:#1e293b
+  style cytek fill:#ecfdf5,stroke:#0f766e,color:#1e293b
+  style fpbase fill:#ecfdf5,stroke:#0f766e,color:#1e293b
+  style custom fill:#ecfdf5,stroke:#0f766e,color:#1e293b
+  style image fill:#ecfdf5,stroke:#0f766e,color:#1e293b
+  style disk fill:#ffffff,stroke:#64748b,color:#1e293b
+  style api fill:#ffffff,stroke:#64748b,color:#1e293b
+  style dyes fill:#ffffff,stroke:#64748b,color:#1e293b
+  style viewer fill:#ffffff,stroke:#64748b,color:#1e293b
+```
+
+| Module | Role |
+| --- | --- |
+| `app.py` | Dye list, **Analyze panel**, pair selection, and the swap section |
+| `spectra_view.py` | Aurora signature overlay, similarity matrix, and wavelength charts |
+| `colinearity.py` | Emission-only, laser-weighted, and 64-channel Pearson and cosine |
+| `recommend.py` | Panel metrics and one-slot replacement scores |
+| `cytek_library.py` | Aurora 5L signatures, cached from spectrum.cytekbio.com |
+| `fpbase_client.py` | Name matching and wavelength curves from FPbase |
+| `custom_store.py` | Saved uploads in `custom_dyes/` |
+| `spectra_image.py` | Digitizes a vendor screenshot into a curve or a 64-channel signature |
+| `cytek_channels.py` | The 64 detector bands and the laser presets |
+| `candidates.py` | Curated replacement reagents |
+
+**Analyze panel** resolves each name, loads the data that source has, then scores
+the panel. The default path never calls FPbase.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#eef2ff',
+  'primaryTextColor': '#1e293b',
+  'primaryBorderColor': '#4f46e5',
+  'lineColor': '#64748b',
+  'edgeLabelBackground': '#ffffff',
+  'clusterBkg': '#f8fafc',
+  'clusterBorder': '#64748b'
+}}}%%
+flowchart LR
+  list["Dye list"] --> resolve["Resolve names"]
+  resolve --> sig["Aurora signatures"]
+  resolve --> curves["Wavelength curves"]
+  sig --> score["Cosine and Pearson"]
+  curves --> score
+  score --> overlay["Signature overlay"]
+  score --> matrix["Similarity matrix"]
+  matrix --> swap["Swap preview"]
+
+  style list fill:#ffffff,stroke:#64748b,color:#1e293b
+  style resolve fill:#eef2ff,stroke:#4f46e5,color:#1e293b
+  style sig fill:#ecfdf5,stroke:#0f766e,color:#1e293b
+  style curves fill:#ecfdf5,stroke:#0f766e,color:#1e293b
+  style score fill:#f1f5f9,stroke:#64748b,color:#1e293b
+  style overlay fill:#eef2ff,stroke:#4f46e5,color:#1e293b
+  style matrix fill:#eef2ff,stroke:#4f46e5,color:#1e293b
+  style swap fill:#eef2ff,stroke:#4f46e5,color:#1e293b
+```
+
+Wavelength curves are loaded only when you choose **Also load wavelength curves**.
+In the default Aurora mode that branch is skipped, and dyes with no signature are
+named under the plot.
+
 ## How to use
 
-1. **Tab 1 -- Fluorophores & spectra**: paste one fluorophore per line (flow-cytometry
-   shorthand like `BV421`, `BUV395`, `PE-Cy7` is fine), click **Match sources**.
+1. Paste one fluorophore per line (flow-cytometry shorthand like `BV421`, `BUV395`,
+   `PE-Cy7` is fine). The box starts with an example panel. Choose **Analyze panel**.
 
-   Two sources are consulted and they complement rather than compete: Cytek's official 5L
-   library supplies the measured 64-channel signature, FPbase supplies the wavelength
-   curves. A summary table shows, per dye, which source feeds which mode, and each dye's
-   Cytek match is noted under its dropdown. The dropdown itself only picks the *FPbase*
-   entry -- it does not affect the Cytek signature.
-2. Review each suggested match. **To supply your own data for a dye that already
-   matched**, use *Add or replace a spectrum for any dye in the list* — an upload there
+   **Aurora signatures** is the default source. It uses Cytek's measured 64-channel
+   library, loads locally, and draws those signatures on the UV1–R8 axis. The closest
+   pair is drawn in color. Choose a row in the pair list, or a cell in the matrix, to
+   put a different pair in front. **Show the rest of the panel** adds the other dyes
+   faintly.
+
+   Cosine is the similarity index (how alike the two channel patterns are). Pearson
+   stays available as a second column and as a matrix color scale. On Cytek's scale,
+   signatures are usually still separable until about 0.98. The counts of pairs above
+   0.4 and 0.5 rank the closer pairs in this panel. They are not a do-not-combine line.
+
+2. **Also load wavelength curves** adds FPbase emission and excitation spectra. Open
+   **Other instruments** for emission-only, a generic 3-laser or 4-laser line, or custom
+   laser wavelengths. The Aurora channel plot remains the view while the score is the
+   64-channel signature. **Wavelength names** corrects a wrong FPbase match.
+
+3. A dye the library does not carry is listed as **Not drawn**. Open it to supply a
+   CSV or a screenshot. To override a dye that did match, use **Replace a spectrum for
+   a dye already in the list**. Either way, choose **Analyze panel** again. An upload
    takes precedence over both FPbase and the Cytek library.
 
-   Dyes with no confident match default to
-   **-- not found / use custom --** rather than silently taking a wrong guess, and say
-   so. For those, supply the spectrum yourself — either a CSV with
-   `wavelength, emission[, excitation]` columns, or a **screenshot of a vendor spectra
-   viewer** (see *Digitising a spectrum from an image* below).
-3. Click **Fetch spectra for matched dyes**.
-4. **Tab 2 -- Colinearity analysis**: choose a mode --
-   - *Emission spectrum only* -- simplest, ignores which laser excites each dye
-   - *Cytek Aurora / Northern Lights 5L* -- weights by 355/405/488/561/640nm excitation
-     and (if the channel-binning box is checked) bins into the real 64 Aurora detector
-     channels -- the most realistic option if you're on that instrument
-   - *Generic 3L / 4L* or *Custom* -- enter your own laser lines
-5. Click **Compute colinearity** to get the heatmap, ranked pairwise table, and CSV/PNG
-   downloads.
-6. **Tab 3 -- Panel recommendations**: pick a dye to replace and get ranked candidate
-   swaps from a curated pool of real flow reagents. Read the caveats in that tab before
-   acting on anything it suggests (see *Recommendations* below).
-7. Under **Preview a swap**, choose a candidate to see the before/after colinearity
-   heatmaps side by side, with the replaced dye's row and column outlined and the
-   panel-level metric deltas above. Both the figure and the post-swap matrix are
-   downloadable.
+4. **Try a swap** ranks replacement reagents for one slot. Read the warning there before
+   acting on a suggestion. The preview draws the current dye, the candidate, and the
+   closest partner on the same channel axis. The before/after matrices are under
+   **Matrix before and after**.
 
 ## Recommendations: what the tool does and does not do
 
@@ -93,7 +209,10 @@ on co-expressed markers may not be.
 
 ## Files
 
+- `pyproject.toml` and `uv.lock` -- dependencies. Install with `uv sync`
 - `app.py` -- Streamlit UI
+- `spectra_view.py` -- signature overlay, similarity matrix, and wavelength charts
+- `tests/test_spectra_view.py` -- checks for the overlay helpers. Run with `uv run python tests/test_spectra_view.py`
 - `fpbase_client.py` -- FPbase GraphQL client + fuzzy name matching
 - `colinearity.py` -- the three similarity computations (emission-only / laser-weighted / Cytek 64-channel)
 - `recommend.py` -- swap scoring and panel-level metrics
@@ -124,17 +243,17 @@ This is the vendor's own *measured* reference signature, so it beats both a comp
 emission x excitation model and a digitised plot: no interpolation, and it already
 contains tandem donor bleed-through, filter transmission and detector response.
 
-**Cytek Aurora 5L only** is the default spectral source (radio at the top of Tab 1) and
-is the right choice for analysis on that instrument: nothing is inferred, and no FPbase
-lookup happens at all, so matching is instant. In that mode Tab 2 is fixed to the
-64-channel analysis, since the other modes need wavelength curves that signatures don't
-carry, and any dye outside the 341 must have a signature supplied or it is excluded --
-called out by name rather than silently dropped.
+**Aurora signatures** is the default spectral source and the right choice for analysis
+on that instrument: nothing is inferred, and no FPbase lookup happens at all, so matching
+is instant. In that mode the score is the 64-channel signature, since the other modes
+need wavelength curves that signatures do not carry. Any dye outside the library must
+have a signature supplied, or it is named under the plot and left out.
 
-Switching the source to **Cytek + FPbase** brings the wavelength modes back. There the
-Cytek signature **layers on top of** FPbase rather than replacing it -- the Cytek mode uses `SIGNATURE`, the wavelength modes keep using the
-FPbase `EM`/`EX` curves, so a dye can be covered in every mode at once. Dyes with no
-FPbase entry end up signature-only and are listed as such after fetching.
+**Also load wavelength curves** brings the wavelength modes back, under **Other
+instruments**. The Cytek signature layers on top of FPbase rather than replacing it.
+The Aurora score uses `SIGNATURE`. The wavelength modes keep using the FPbase `EM`/`EX`
+curves, so a dye can be covered in every mode at once. Dyes with no FPbase entry end up
+signature-only and are named on the wavelength chart.
 
 Measured against this library, the two digitisers came out well -- BUV 615 read by eye
 scored cosine 0.9988 vs official, APC/Fire 810 machine-extracted 0.9820, both with the
@@ -187,8 +306,7 @@ the exception and is queried directly: documented GraphQL API, openly licensed d
 Anything you supply by hand — a CSV, a digitised wavelength spectrum, or a digitised
 Cytek signature — is written to `custom_dyes/` (one JSON per dye, with provenance) and
 reloaded automatically on the next launch. Name the dye in your list and it is used
-without re-uploading; the fetch step reports which saved dyes it reused. Tab 1 has an
-expander listing what is stored, with a delete control.
+without re-uploading. **Advanced** lists what is stored, with a delete control.
 
 Pre-seeded, both digitised from vendor signature plots:
 
@@ -229,8 +347,8 @@ markedly more robust than tracing a continuous curve.
 ### Wavelength spectrum
 
 x axis in nanometres — the classic excitation/emission plot. Use this when no signature
-plot is published. In Tab 1 choose **-- not found / use custom --**, then
-*Screenshot: wavelength spectrum*.
+plot is published. Open the dye under **Not drawn**, then choose
+**Screenshot: wavelength spectrum**.
 
 You supply: the plot-box pixel corners (an annotated pixel ruler is drawn over your
 image), the wavelength at each x edge, the value at each y edge, and the curve colour
@@ -266,14 +384,16 @@ data, so treat a digitised dye as triage rather than evidence.
 Short queries are the tricky case. The matcher is token- and parenthetical-aware so that
 `PE` resolves to `PE (R-PE / R-phycoerythrin)` rather than to `PE-Cy5` or
 `Alexa Fluor 647-R-phycoerythrin (R-PE)`, and `APC` to `APC (allophycocyanin)` rather
-than `APC/H7`. **Always eyeball the matched names in Tab 1** -- a silently wrong match
-produces plausible-looking but meaningless numbers.
+than `APC/H7`. **Always check the names under Wavelength names** when that source is
+on. A silently wrong match produces plausible-looking but meaningless curves. The
+Aurora signature match is stricter and is what the default plot uses.
 
 ## Known limitations
 
-- Dyes not cataloged on FPbase (`APC/Fire 810` and `BUV 615` as of Aug 2026) need a CSV
-  or a digitised screenshot -- there's no scriptable public API for Cytek's own spectra
-  viewer.
+- Dyes with no FPbase entry have no wavelength curve. `APC/Fire 810` and `BUV 615`
+  are in the Aurora library, so the default signature view still draws them. A wavelength
+  view needs a CSV or a digitised screenshot. There is no scriptable public API for
+  Cytek's own spectra viewer.
 - Excitation efficiency uses absorption spectra as a fallback when FPbase has no
   dedicated excitation curve for a dye (noted in the fetch step).
 - A dye with an emission curve but no excitation curve is dropped from the laser-weighted
