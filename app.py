@@ -1,24 +1,18 @@
 """
 Fluorophore Colinearity Explorer
 ---------------------------------
-Streamlit GUI for spectral colinearity analysis of a flow panel:
-  1. paste a fluorophore list; each name resolves against Cytek's official Aurora 5L
-     signature library *and* FPbase (the two complement each other -- Cytek supplies the
-     measured 64-channel signature, FPbase the wavelength curves)
-  2. (optionally) upload or digitise data for dyes neither source has, or to override
-  3. compute pairwise similarity: emission-only, laser-weighted, or binned into
-     a real spectral cytometer's detector channels (e.g. Cytek Aurora 5L)
-  4. view heatmaps + ranked pairs table, download PNG/CSV
+Streamlit GUI for spectral overlap of a flow panel.
+
+The screen draws peak-normalized Aurora 5L signatures, brings the closest
+pair forward, and scores that pair with cosine (the similarity index) and
+Pearson. Wavelength curves are a second view, used when FPbase spectra are
+loaded. Swap suggestions stay spectral suggestions, not panel design.
 
 Run with:  streamlit run app.py
 """
-import io
-import json
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 import streamlit as st
 
 import fpbase_client as fp
@@ -26,18 +20,21 @@ import colinearity as col
 import recommend as rec
 import candidates as cand_mod
 import spectra_image as si
+import spectra_view as sv
 import custom_store
 import cytek_library
 import spectra_sources
-from cytek_channels import CYTEK_5L_CHANNELS, LASER_PRESETS
+from cytek_channels import LASER_PRESETS
 
-st.set_page_config(page_title="Fluorophore Colinearity Explorer", layout="wide")
-st.title("Fluorophore Colinearity Explorer")
+st.set_page_config(
+    page_title="Panel overlap",
+    page_icon=":material/show_chart:",
+    layout="wide",
+)
+st.title("Panel overlap", icon=":material/show_chart:")
 st.caption(
-    "Pairwise spectral similarity ('colinearity') for a flow panel. Signatures come from "
-    "**Cytek's official Aurora 5L library** where available, with **FPbase** wavelength "
-    "spectra alongside for the emission-only and generic-laser modes; anything neither "
-    "has can be digitised from a vendor plot."
+    "How alike each pair of fluorophores looks on an Aurora 5L. "
+    "A higher cosine means the two channel patterns are harder to tell apart."
 )
 
 # Reference panel. APC/Fire 810 and BUV 615 have no FPbase entry as of Aug 2026 -- they
@@ -396,727 +393,976 @@ def image_digitizer_ui(q: str, ns: str = ""):
         )
 
 
-tab1, tab2, tab3 = st.tabs(
-    ["1. Fluorophores & spectra", "2. Colinearity analysis", "3. Panel recommendations"]
+CYTEK_PRESET = "Cytek Aurora / Northern Lights 5L (355/405/488/561/640)"
+NOT_FOUND = "-- not found / use custom --"
+SCORE_NOTE = (
+    "Cosine is how alike the two channel patterns are. "
+    "Pearson is whether they rise and fall together. These lines are the patterns both numbers use."
+)
+SCALE_NOTE = (
+    "On Cytek's scale, signatures are usually still separable until about 0.98. "
+    "Pairs above 0.4 and 0.5 are the closer pairs in this panel, and they are how a swap is judged. "
+    "They are not a do-not-combine line. Co-expression matters more than the number."
+)
+SWAP_WARNING = (
+    "**These are spectral suggestions only. They are not panel design.** "
+    "Before acting on any of them, check that (1) the reagent actually exists "
+    "conjugated to your clone, (2) the dye's brightness suits that marker's "
+    "expression level (dim dyes on high-expression markers, bright dyes on low), "
+    "and (3) the markers involved are actually co-expressed on the same cells. "
+    "Two colinear dyes on mutually exclusive populations rarely matter. "
+    "Spectral similarity is one input to panel design, not the objective function."
 )
 
-# ------------------------------------------------------------------ TAB 1 ---
-with tab1:
-    for prob in st.session_state.get("custom_load_problems", []):
-        st.warning(f"Could not load a saved custom dye — {prob}")
 
-    saved_meta = custom_store.metadata()
-    if saved_meta:
-        with st.expander(f"Saved custom dyes ({len(saved_meta)}) — reused automatically"):
-            st.caption(
-                "Dyes FPbase doesn't carry, kept in `custom_dyes/`. Any of these named in "
-                "your list below is used without re-uploading anything."
+def _theme() -> dict:
+    context = getattr(st, "context", None)
+    theme = getattr(context, "theme", None)
+    if theme is not None and getattr(theme, "type", "light") == "dark":
+        return {"ink": "#e6edf3", "muted": "#9aa6b2", "grid": "#3a4654", "diag": "#2c3542"}
+    return {"ink": "#1b2430", "muted": "#5c6b7a", "grid": "#d5dde6", "diag": "#e7ebf0"}
+
+
+def _remember(token: str, key: str) -> bool:
+    """True only when a widget selection changes after the first run."""
+    previous = st.session_state.get(key)
+    st.session_state[key] = token
+    return previous is not None and token != previous
+
+
+def _cell_pair(selection) -> tuple[str, str] | None:
+    if not selection:
+        return None
+    try:
+        payload = selection["cell"]
+    except Exception:
+        return None
+    if not payload:
+        return None
+    if isinstance(payload, (list, tuple)):
+        if not payload or not isinstance(payload[0], dict):
+            return None
+        item = payload[0]
+        a, b = item.get("dye_x"), item.get("dye_y")
+    else:
+        try:
+            xs, ys = payload["dye_x"], payload["dye_y"]
+        except Exception:
+            return None
+        if not xs or not ys:
+            return None
+        a, b = xs[0], ys[0]
+    if not a or not b or a == b:
+        return None
+    return a, b
+
+
+def resolve_panel(queries: list[str], cytek_only: bool, refresh_index: bool):
+    """Match names and load signatures. FPbase is contacted only in wavelength mode."""
+    st.session_state.selections = {}
+    if cytek_only:
+        st.session_state.owner_lookup = {}
+        st.session_state.all_dye_names = []
+        for query in queries:
+            st.session_state.selections[query] = None
+    else:
+        index_entries = fp.get_dye_index(force_refresh=refresh_index)
+        st.session_state.owner_lookup = fp.build_owner_lookup(index_entries)
+        all_names = sorted(st.session_state.owner_lookup)
+        st.session_state.all_dye_names = all_names
+        for query in queries:
+            suggestions = fp.suggest_matches(query, all_names, n=5)
+            confident = fp.has_confident_match(query, all_names)
+            st.session_state.selections[query] = (
+                suggestions[0] if suggestions and confident else None
             )
-            st.dataframe(pd.DataFrame(saved_meta)[["dye", "data", "source", "saved", "note"]],
-                         use_container_width=True, hide_index=True)
-            dead = st.selectbox("Remove one", ["—"] + [r["dye"] for r in saved_meta],
-                                key="del_custom")
-            if dead != "—" and st.button(f"Delete '{dead}'", key="del_custom_btn"):
+
+    dye_data: dict = {}
+    missing: list[str] = []
+    reused: list[str] = []
+    from_cytek: list[str] = []
+    items = list(st.session_state.selections.items())
+    progress = st.progress(0.0, text="Loading wavelength curves") if not cytek_only else None
+    for i, (query, fp_name) in enumerate(items):
+        custom = st.session_state.custom_curves.get(query)
+        if fp_name is not None:
+            ids = st.session_state.owner_lookup[fp_name]
+            dye_data[query] = fp.fetch_dye_curves(fp_name, ids)
+        if custom:
+            entry = dye_data.get(query, {"fpbase_name": "(custom)"})
+            entry.update({k: v for k, v in custom.items() if k != "fpbase_name"})
+            dye_data[query] = entry
+            reused.append(query)
+        hit = cytek_library.signature(query)
+        if hit:
+            lib_name, signature = hit
+            entry = dye_data.get(query, {"fpbase_name": f"(Cytek: {lib_name})"})
+            if not (custom and "SIGNATURE" in custom):
+                entry["SIGNATURE"] = signature.tolist()
+                entry["cytek_name"] = lib_name
+                from_cytek.append(query)
+            dye_data[query] = entry
+        if query not in dye_data:
+            missing.append(query)
+        if progress is not None:
+            progress.progress((i + 1) / max(len(items), 1), text=f"Loading {query}")
+    if progress is not None:
+        progress.empty()
+    return dye_data, missing, reused, from_cytek
+
+
+def compute_view(dye_data: dict, preset_name: str, use_channels: bool, custom_txt: str) -> dict:
+    """Pearson and cosine for the selected instrument. Does not draw anything."""
+    warnings: list[str] = []
+    em_curves, ex_curves = col.build_curves(dye_data)
+    preset = LASER_PRESETS[preset_name]
+    if preset == "custom":
+        try:
+            wavelengths = [float(part.strip()) for part in (custom_txt or "").split(",") if part.strip()]
+        except ValueError:
+            return {"error": "Could not parse laser wavelengths. Use comma-separated numbers, such as 405, 488, 640."}
+        if not wavelengths:
+            return {"error": "Enter at least one laser wavelength."}
+        lasers = {f"L{int(wave)}": wave for wave in wavelengths}
+    else:
+        lasers = preset
+
+    cytek_lasers = LASER_PRESETS[CYTEK_PRESET]
+    try:
+        if lasers is None:
+            if len(em_curves) < 2:
+                return {"error": "Fewer than two dyes have wavelength curves, so there is no emission-shape comparison."}
+            pearson, cosine = col.emission_only_similarity(em_curves)
+            mode, label = "emission", "Emission shape"
+            extra = {"em": em_curves, "ex": ex_curves}
+        elif use_channels and set(lasers) == set(cytek_lasers):
+            signature = rec.cytek_signature(dye_data)
+            if len(signature) < 2:
+                return {"error": "Fewer than two dyes have usable Aurora signatures, so there are no pairs to compare."}
+            cosine = rec.cosine_matrix(signature)
+            pearson = pd.DataFrame(
+                np.corrcoef(signature.values), index=signature.index, columns=signature.index
+            )
+            mode, label = "cytek", "Aurora 5L signatures"
+            extra = {
+                "signature": signature,
+                "em": em_curves,
+                "ex": ex_curves,
+                "peak_channel": signature.idxmax(axis=1),
+            }
+            dropped = [name for name in dye_data if name not in signature.index]
+            if dropped:
+                warnings.append(
+                    "Not in this Aurora comparison: "
+                    + ", ".join(dropped)
+                    + ". A dye needs a 64-channel signature, or both an emission curve and an excitation curve."
+                )
+        else:
+            usable = [name for name in em_curves if name in ex_curves]
+            if len(usable) < 2:
+                return {"error": "Fewer than two dyes have both emission and excitation curves for this laser set."}
+            pearson, cosine, laser_eff = col.laser_weighted_similarity(em_curves, ex_curves, lasers)
+            phrase = ", ".join(f"{wave:g} nm" for wave in lasers.values())
+            mode, label = "laser", f"Laser-weighted emission ({phrase})"
+            extra = {"em": em_curves, "ex": ex_curves, "lasers": lasers, "laser_eff": laser_eff}
+            no_ex = [name for name in em_curves if name not in ex_curves]
+            if no_ex:
+                warnings.append(
+                    "No excitation curve for: "
+                    + ", ".join(no_ex)
+                    + ". They are excluded from this laser-weighted result."
+                )
+            signature_only = [name for name in dye_data if name not in em_curves]
+            if signature_only:
+                warnings.append(
+                    "Signature only, so not on this wavelength plot: " + ", ".join(signature_only) + "."
+                )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    return {
+        "error": None,
+        "warnings": warnings,
+        "pearson": pearson.fillna(0.0),
+        "cosine": cosine.fillna(0.0),
+        "mode": mode,
+        "label": label,
+        "extra": extra,
+    }
+
+
+def dye_status_frame(queries, dye_data, panel_sig) -> pd.DataFrame:
+    rows = []
+    custom = st.session_state.custom_curves
+    for query in queries:
+        entry = dye_data.get(query)
+        peak, laser = "—", "—"
+        if panel_sig is not None and query in panel_sig.index:
+            peak = str(panel_sig.loc[query].idxmax())
+            laser = sv.laser_label(peak)
+        if entry is None:
+            source = "No Aurora signature"
+        elif query in custom and "SIGNATURE" in custom[query]:
+            source = "Your upload"
+        elif entry.get("cytek_name"):
+            source = "Cytek library"
+        elif "EM" in entry:
+            source = "Wavelength curves"
+        elif "SIGNATURE" in entry:
+            source = "Signature"
+        else:
+            source = "No Aurora signature"
+        rows.append({"Dye": query, "Peak": peak, "Laser": laser, "Source": source})
+    return pd.DataFrame(rows)
+
+
+def pair_frame(pearson, cosine, signature, selected, score: str) -> pd.DataFrame:
+    ranked = col.ranked_pairs(pearson, cosine)
+    metric = "pearson_r" if score == "Pearson" else "cosine_sim"
+    ranked = ranked.sort_values(metric, ascending=False).reset_index(drop=True)
+    shared, shown = [], []
+    for row in ranked.itertuples(index=False):
+        if (
+            signature is not None
+            and row.dye_1 in signature.index
+            and row.dye_2 in signature.index
+        ):
+            runs = sv.shared_runs(signature.loc[row.dye_1], signature.loc[row.dye_2])
+            shared.append(", ".join(runs) if runs else "low tail")
+        else:
+            shared.append("")
+        shown.append("Yes" if sv.same_pair(selected, row.dye_1, row.dye_2) else "")
+    frame = pd.DataFrame(
+        {
+            "Dye 1": ranked.dye_1,
+            "Dye 2": ranked.dye_2,
+            "Cosine": ranked.cosine_sim,
+            "Pearson": ranked.pearson_r,
+            "Shared channels": shared,
+            "On plot": shown,
+        }
+    )
+    if signature is None:
+        frame = frame.drop(columns=["Shared channels"])
+    return frame
+
+
+def unresolved_panel(query: str):
+    st.markdown(f"**Find `{query}` online**")
+    st.caption(
+        "These open the vendor spectra viewer for this dye. "
+        "Screenshot the plot, then load it below. Prefer a channel-signature plot. "
+        "Its x-axis reads UV1 through R8."
+    )
+    for source in spectra_sources.links_for(query):
+        st.markdown(f"- [{source['name']}]({source['href']}). {source['gives']}. {source['note']}")
+    manual_source_ui(query, key_prefix="missing")
+    st.caption("Choose Analyze panel again after the spectrum is saved.")
+
+
+def _hero_caption(view, pair) -> str:
+    pearson, cosine = view["pearson"], view["cosine"]
+    a, b = pair
+    c_val = float(cosine.loc[a, b])
+    p_val = float(pearson.loc[a, b])
+    if view["mode"] == "cytek":
+        return sv.pair_caption(a, b, view["extra"]["signature"], c_val, p_val)
+    if view["mode"] == "emission":
+        text = (
+            f"{a} and {b}. Cosine {c_val:.2f}. Pearson {p_val:.2f}. "
+            "These are peak-normalized emission shapes. Lasers are not in this score."
+        )
+        ex = view["extra"].get("ex") or {}
+        if a in ex or b in ex:
+            text += " Dashed lines are excitation."
+        return text
+    return (
+        f"{a} and {b}. Cosine {c_val:.2f}. Pearson {p_val:.2f}. "
+        "Each panel is emission multiplied by excitation at that laser."
+    )
+
+
+def _draw_hero(view, pair, show_rest: bool, ink: str, muted: str, grid: str):
+    colors = st.session_state.colors
+    names = list(view["cosine"].index)
+    others = [name for name in names if name not in pair]
+    shown = list(pair) + (others if show_rest else [])
+    if view["mode"] == "cytek":
+        signature = view["extra"]["signature"]
+        styles = sv.pair_styles(pair, names, show_rest)
+        chart = sv.signature_chart(
+            signature.loc[list(styles)],
+            styles,
+            colors,
+            label_dyes=list(pair),
+            ink=ink,
+            muted=muted,
+            grid=grid,
+        )
+        st.altair_chart(chart, theme=None)
+        return
+    em, ex = view["extra"]["em"], view["extra"]["ex"]
+    dyes = [name for name in shown if name in em]
+    missing = [name for name in pair if name not in em]
+    if missing:
+        st.caption(
+            ", ".join(missing)
+            + " has an Aurora signature and no wavelength curve, so it is not on this plot."
+        )
+    if view["mode"] == "emission":
+        chart = sv.emission_chart(em, ex, dyes, colors, ink=ink, show_lasers=False)
+    else:
+        chart = sv.laser_weighted_chart(em, ex, view["extra"]["lasers"], dyes, colors, ink=ink)
+    if chart is None:
+        st.caption("Choose a pair in the list or on the matrix. Those two signatures draw here.")
+    else:
+        st.altair_chart(chart, theme=None)
+
+
+def _downloads(view, pairs: pd.DataFrame):
+    with st.expander("Download", icon=":material/download:"):
+        with st.container(horizontal=True):
+            st.download_button(
+                "Pair list",
+                pairs.to_csv(index=False),
+                "pairwise_similarity.csv",
+                "text/csv",
+                key="dl_pairs",
+            )
+            st.download_button(
+                "Cosine matrix",
+                view["cosine"].to_csv(),
+                "cosine_similarity.csv",
+                "text/csv",
+                key="dl_cosine",
+            )
+            st.download_button(
+                "Pearson matrix",
+                view["pearson"].to_csv(),
+                "pearson_correlation.csv",
+                "text/csv",
+                key="dl_pearson",
+            )
+            if "signature" in view["extra"]:
+                st.download_button(
+                    "64-channel signatures",
+                    view["extra"]["signature"].to_csv(),
+                    "aurora_signatures.csv",
+                    "text/csv",
+                    key="dl_sig",
+                )
+
+
+def _swap_overlay(panel_sig, slot, pick, partner, new_partner, pool):
+    candidate = rec.cytek_signature({pick: pool[pick]})
+    rows = {slot: panel_sig.loc[slot], pick: candidate.loc[pick]}
+    styles = {
+        slot: {"opacity": 1.0, "width": 2.6, "dash": "solid"},
+        pick: {"opacity": 1.0, "width": 2.6, "dash": "dash"},
+    }
+    if partner in panel_sig.index and partner not in rows:
+        rows[partner] = panel_sig.loc[partner]
+        styles[partner] = {"opacity": 0.35, "width": 1.6, "dash": "solid"}
+    if (
+        new_partner
+        and new_partner != partner
+        and new_partner in panel_sig.index
+        and new_partner not in rows
+    ):
+        rows[new_partner] = panel_sig.loc[new_partner]
+        styles[new_partner] = {"opacity": 0.35, "width": 1.6, "dash": "dot"}
+    frame = pd.DataFrame(rows).T
+    frame = frame.reindex(columns=panel_sig.columns)
+    colors = sv.assign_colors(list(frame.index), st.session_state.colors)
+    st.session_state.colors = colors
+    theme = _theme()
+    st.altair_chart(
+        sv.signature_chart(
+            frame,
+            styles,
+            colors,
+            label_dyes=[slot, pick],
+            ink=theme["ink"],
+            muted=theme["muted"],
+            grid=theme["grid"],
+        ),
+        theme=None,
+    )
+    bits = [f"{slot} is solid.", f"{pick} is dashed."]
+    if partner in styles and partner != slot:
+        bits.append(f"{partner} is the current closest partner, drawn lighter.")
+    if new_partner and new_partner != partner and new_partner in styles:
+        bits.append(f"{new_partner} is the closest partner after the swap, drawn lighter.")
+    st.caption(" ".join(bits))
+
+
+# ---------------------------------------------------------------------------
+# Page. Fast controls render first. Loading signatures happens on the button.
+# ---------------------------------------------------------------------------
+
+for problem in st.session_state.get("custom_load_problems", []):
+    st.warning(f"Could not load a saved custom dye. {problem}")
+
+left, right = st.columns([1, 2.35], gap="large")
+with left:
+    st.subheader("Dyes")
+    raw_list = st.text_area(
+        "Fluorophores, one per line",
+        value=EXAMPLE_LIST,
+        height=220,
+        key="dye_list",
+        help="Flow shorthand is fine: BV421, BUV395, PE-Cy7. The list in the box is an example.",
+    )
+    queries = list(dict.fromkeys(line.strip() for line in raw_list.splitlines() if line.strip()))
+    source = st.radio(
+        "Spectral source",
+        ["Aurora signatures", "Also load wavelength curves"],
+        key="source_choice",
+        help=(
+            "Aurora signatures are the instrument's measured 64-channel library and load locally. "
+            "Wavelength curves come from FPbase and add emission-shape and generic-laser views."
+        ),
+    )
+    cytek_only = source != "Also load wavelength curves"
+    refresh_index = False
+    with st.expander("Advanced", icon=":material/tune:"):
+        refresh_index = st.checkbox(
+            "Force-refresh FPbase dye index",
+            value=False,
+            disabled=cytek_only,
+            key="refresh_index",
+        )
+        saved_meta = custom_store.metadata()
+        if saved_meta:
+            st.caption("Saved dyes are reused when you analyze a list that names them.")
+            st.dataframe(
+                pd.DataFrame(saved_meta)[["dye", "data", "source", "saved", "note"]],
+                hide_index=True,
+            )
+            dead = st.selectbox(
+                "Remove a saved dye",
+                ["—"] + [row["dye"] for row in saved_meta],
+                key="del_custom",
+            )
+            if dead != "—" and st.button(f"Delete {dead}", key="del_custom_btn"):
                 custom_store.delete(dead)
                 st.session_state.custom_curves.pop(dead, None)
-                st.success(f"Deleted {dead}.")
+                st.toast(f"Deleted {dead}")
                 st.rerun()
-
-    st.subheader("Fluorophore list")
-    raw_list = st.text_area(
-        "One fluorophore per line (common flow-cytometry shorthand is fine, e.g. BV421, BUV395):",
-        value=EXAMPLE_LIST,
-        height=260,
+        else:
+            st.caption("No saved custom dyes yet.")
+    analyze = st.button(
+        "Analyze panel",
+        type="primary",
+        icon=":material/query_stats:",
+        key="analyze",
     )
-    queries = [ln.strip() for ln in raw_list.splitlines() if ln.strip()]
-
-    _lib_n = len(cytek_library.load())
-    SRC_CYTEK = f"Cytek Aurora 5L only — {_lib_n} fluorochromes (recommended)"
-    SRC_BOTH = "Cytek + FPbase (adds wavelength curves for the non-Cytek modes)"
-    source_mode = st.radio(
-        "Spectral source",
-        [SRC_CYTEK, SRC_BOTH],
-        key="source_mode",
-        help="Cytek-only is the right choice for analysis on an Aurora 5L: these are the "
-             "instrument's own measured 64-channel signatures, so nothing is inferred and "
-             "no FPbase lookup is needed (which also makes matching instant). Add FPbase "
-             "only if you want the emission-only or generic-laser modes, which need "
-             "wavelength curves.",
+    analyzed = st.session_state.get("analyzed_queries")
+    dirty = analyzed is not None and (
+        queries != analyzed or cytek_only != st.session_state.get("analyzed_cytek_only")
     )
-    cytek_only = source_mode == SRC_CYTEK
-    use_cytek_lib = True
+    if dirty:
+        st.caption("The list or the source has changed. Analyze panel to update the plot.")
+    status_slot = st.container()
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        refresh_index = st.checkbox("Force-refresh FPbase dye index", value=False,
-                                    disabled=cytek_only)
-    with colB:
-        do_match = st.button("Match sources", type="primary")
+with right:
+    right_box = st.container()
 
-    if do_match:
-        st.session_state.cytek_only = cytek_only
-        st.session_state.selections = {}
-        if cytek_only:
-            # Skip FPbase entirely: no index download, no per-dye name guessing, and no
-            # chance of a wrong FPbase match quietly supplying the wavelength curves.
-            st.session_state.owner_lookup = {}
-            st.session_state.all_dye_names = []
-            for q in queries:
-                st.session_state.selections[q] = None
-        else:
-            with st.spinner("Loading FPbase index..."):
-                index_entries = fp.get_dye_index(force_refresh=refresh_index)
-                st.session_state.owner_lookup = fp.build_owner_lookup(index_entries)
-                all_names = sorted(st.session_state.owner_lookup.keys())
-            st.session_state.all_dye_names = all_names
-            for q in queries:
-                suggestions = fp.suggest_matches(q, all_names, n=5)
-                confident = fp.has_confident_match(q, all_names)
-                st.session_state.selections[q] = suggestions[0] if (suggestions and confident) else None
-        n_cy = sum(1 for q in queries if cytek_library.find(q))
-        n_missing = len(queries) - n_cy
-        if cytek_only:
-            st.success(
-                f"Matched against Cytek's official Aurora 5L library "
-                f"({len(cytek_library.load())} fluorochromes) — {n_cy} of {len(queries)} "
-                "resolved."
-                + (f" {n_missing} not in the library; supply those below."
-                   if n_missing else "")
-            )
-        else:
-            st.success(
-                f"Matched against Cytek's 5L library ({n_cy}/{len(queries)} resolved) and "
-                f"FPbase ({len(st.session_state.all_dye_names)} fluorophores) for the "
-                "wavelength curves. Review below."
-            )
-
-    if "all_dye_names" in st.session_state and queries:
-        cytek_only = st.session_state.get("cytek_only", True)
-        st.subheader("Review matches")
-        if cytek_only:
-            st.caption(
-                "Every dye uses Cytek's own measured 64-channel signature — nothing is "
-                "inferred from reference spectra. Anything the library doesn't carry needs "
-                "a signature supplied below, or it is excluded from the analysis."
-            )
-        else:
-            st.caption(
-                "The dropdown picks the **FPbase** entry, which supplies the wavelength "
-                "curves. Where Cytek publishes an official 5L signature it is noted under "
-                "the dye and is what the Cytek 64-channel mode actually uses — the two "
-                "work together. Choose **-- not found / use custom --** to supply your own."
-            )
-
-        # Source resolution at a glance, before fetching -- otherwise the only signal
-        # that Cytek is being used at all arrives after the fetch step.
-        rows = []
-        for q in queries:
-            cy = cytek_library.find(q)
-            fpn = st.session_state.selections.get(q)
-            custom = q in st.session_state.custom_curves
-            row = {
-                "dye": q,
-                "Cytek 5L signature": cy or "—",
-                "your upload": "yes (overrides)" if custom else "—",
-                "used for analysis": ("your upload" if custom and
-                                      "SIGNATURE" in st.session_state.custom_curves[q]
-                                      else "Cytek official" if cy
-                                      else "computed from FPbase" if fpn and not cytek_only
-                                      else "NOTHING — dye excluded"),
-            }
-            if not cytek_only:
-                row["FPbase (wavelength curves)"] = fpn or "—"
-            rows.append(row)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        gap = [r["dye"] for r in rows if r["used for analysis"].startswith("NOTHING")]
-        if gap:
-            st.warning(
-                f"**Not in Cytek's library: {', '.join(gap)}.** Supply a signature for "
-                "each below (screenshot of a vendor channel-signature plot works), or they "
-                "drop out of the analysis."
-            )
-
-        NOT_FOUND = "-- not found / use custom --"
-        for q in queries:
-            cy_name = cytek_library.find(q)
-
-            if cytek_only:
-                # No FPbase dropdown to show; the only decision left is what to do about
-                # dyes the library lacks.
-                if cy_name:
-                    continue
-            else:
-                suggestions = fp.suggest_matches(q, st.session_state.all_dye_names, n=8)
-                confident = fp.has_confident_match(q, st.session_state.all_dye_names)
-                options = suggestions + [NOT_FOUND]
-                current = st.session_state.selections.get(q)
-                if current in options:
-                    default_idx = options.index(current)
-                elif suggestions and confident:
-                    default_idx = 0
-                else:
-                    default_idx = len(options) - 1        # NOT_FOUND
-                choice = st.selectbox(f"**{q}**", options, index=default_idx, key=f"match_{q}")
-                st.session_state.selections[q] = None if choice == NOT_FOUND else choice
-                if cy_name:
-                    st.caption(
-                        f":green[Cytek official 5L signature: **{cy_name}**] — this is "
-                        "what the Cytek 64-channel mode will use, regardless of the "
-                        "FPbase choice above."
-                    )
-                if not confident:
-                    nearest = suggestions[0] if suggestions else None
-                    extra = (f" The closest name FPbase has is `{nearest}`, which is a "
-                             "spelling-similarity guess, not the same reagent."
-                             if nearest else "")
-                    st.caption(
-                        f":orange[No confident match for **{q}** on FPbase.]{extra} "
-                        "Supply the spectrum yourself below unless you recognise a "
-                        "genuine match in the list."
-                    )
-                if cy_name:
-                    continue
-                needs_input = choice == NOT_FOUND
-
-            if cytek_only:
-                needs_input = True     # reached only when the library has no entry
-
-            if needs_input:
-                # keep it open once the user is working in here, otherwise every widget
-                # interaction reruns the script and folds the panel shut mid-task
-                open_key = f"expanded_{q}"
-                with st.expander(f"Supply a spectrum for '{q}'",
-                                 expanded=st.session_state.get(open_key, False)):
-                    st.session_state[open_key] = True
-                    if q in st.session_state.custom_curves:
-                        have = ", ".join(k for k in ("SIGNATURE", "EM", "EX", "AB")
-                                         if k in st.session_state.custom_curves[q])
-                        st.success(f"Already saved for **{q}** ({have}) — nothing to do "
-                                   "unless you want to replace it.")
-                    with st.container():
-                        st.markdown(f"**Find `{q}` online**")
-                        st.caption(
-                            "These open the vendor's own spectra viewer for this dye. "
-                            "Screenshot the plot there, then load it below — prefer a "
-                            "**channel signature** plot over a wavelength spectrum."
-                        )
-                        for s in spectra_sources.links_for(q):
-                            st.markdown(
-                                f"- [{s['name']}]({s['href']}) — *{s['gives']}* — "
-                                f"<span style='opacity:.75'>{s['note']}</span>",
-                                unsafe_allow_html=True,
-                            )
-                    st.divider()
-                    # Screenshot first, and the default: it is the common case and the
-                    # most accurate source. Having CSV first meant a PNG dropped into the
-                    # CSV uploader (which took any file type) died on "'utf-8' codec
-                    # can't decode byte 0x89" -- the PNG magic byte.
-                    src = st.radio(
-                        "Source",
-                        ["Screenshot: Cytek channel signature",
-                         "Screenshot: wavelength spectrum",
-                         "CSV file"],
-                        key=f"src_{q}",
-                        help="Screenshot of a plot whose x axis reads 'Emission Channel' "
-                             "(UV1…R8) → first option. Plot in nanometres → second. "
-                             "Only pick CSV if you have actual numeric data.",
-                    )
-                    if src == "CSV file":
-                        st.caption(
-                            "Numeric CSV with columns: wavelength, emission, [excitation]. "
-                            "Excitation is optional but required for laser-weighted / Cytek "
-                            "modes. **Screenshots go in one of the options above, not here.**"
-                        )
-                        up = st.file_uploader(
-                            f"upload_{q}", key=f"upload_{q}", label_visibility="collapsed",
-                            type=["csv", "txt", "tsv"],
-                        )
-                        if up is not None:
-                            head = up.read(8)
-                            up.seek(0)
-                            if head.startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8")):
-                                st.error(
-                                    "That's an image, not a CSV. Pick **Screenshot: Cytek "
-                                    "channel signature** above if its x axis is UV1…R8, or "
-                                    "**Screenshot: wavelength spectrum** if it's in nm."
-                                )
-                            else:
-                                try:
-                                    df = pd.read_csv(up)
-                                    df.columns = [c.strip().lower() for c in df.columns]
-                                    missing_cols = {"wavelength", "emission"} - set(df.columns)
-                                    if missing_cols:
-                                        raise ValueError(
-                                            "missing column(s): "
-                                            + ", ".join(sorted(missing_cols))
-                                            + f". Found: {', '.join(df.columns)}"
-                                        )
-                                    entry = {"EM": df[["wavelength", "emission"]].values.tolist()}
-                                    if "excitation" in df.columns:
-                                        entry["EX"] = df[["wavelength", "excitation"]].values.tolist()
-                                    ok, err = remember_custom(q, entry, source="CSV upload",
-                                                              note=f"{len(df)} points")
-                                    st.success(
-                                        f"Loaded custom spectrum for {q} ({len(df)} points)."
-                                        + ("  \nStored in `custom_dyes/` — it will load "
-                                           "automatically next time." if ok else "")
-                                    )
-                                    if not ok:
-                                        st.warning(f"Session only — disk write failed: {err}")
-                                except Exception as e:
-                                    st.error(f"Could not read that CSV — {e}")
-                    elif src == "Screenshot: Cytek channel signature":
-                        signature_digitizer_ui(q)
-                    else:
-                        image_digitizer_ui(q)
-
-        # A dye that resolved against FPbase or the Cytek library never shows the
-        # "not found" panel, so without this there is no way to supply your own data for
-        # it -- e.g. a signature straight off your own instrument, or a newer plot than
-        # the cached library has.
-        with st.expander("Add or replace a spectrum for any dye in the list"):
-            st.caption(
-                "Use this when a dye already matched but you want to override it with "
-                "your own data — a signature off your own instrument, or a newer plot "
-                "than the cached library carries. What you add here takes precedence "
-                "over both FPbase and the Cytek library."
-            )
-            target = st.selectbox("Dye", queries, key="manual_target")
-            if target:
-                manual_source_ui(target, key_prefix="manual")
-
-        if st.button("Fetch spectra for matched dyes", type="primary"):
-            dye_data = {}
-            missing, reused, from_cytek = [], [], []
-            progress = st.progress(0.0, text="Fetching...")
-            items = list(st.session_state.selections.items())
-            for i, (q, fp_name) in enumerate(items):
-                custom = st.session_state.custom_curves.get(q)
-                if fp_name is not None:
-                    ids = st.session_state.owner_lookup[fp_name]
-                    dye_data[q] = fp.fetch_dye_curves(fp_name, ids)
-                if custom:
-                    entry = dye_data.get(q, {"fpbase_name": "(custom)"})
-                    entry.update({k: v for k, v in custom.items() if k != "fpbase_name"})
-                    dye_data[q] = entry
-                    reused.append(q)
-
-                # Cytek's measured signature layers *on top of* whatever we have: the
-                # Cytek mode prefers SIGNATURE, the wavelength modes still use EM/EX,
-                # so a dye can be covered in every mode at once. An explicit upload wins
-                # though -- overriding it here would make the override control useless.
-                if use_cytek_lib:
-                    hit = cytek_library.signature(q)
-                    if hit:
-                        lib_name, sig = hit
-                        entry = dye_data.get(q, {"fpbase_name": f"(Cytek: {lib_name})"})
-                        if not (custom and "SIGNATURE" in custom):
-                            entry["SIGNATURE"] = sig.tolist()
-                            entry["cytek_name"] = lib_name
-                            from_cytek.append(q)
-                        dye_data[q] = entry
-                        if q in missing:
-                            missing.remove(q)
-
-                if q not in dye_data:
-                    missing.append(q)
-                progress.progress((i + 1) / len(items), text=f"Fetching... {q}")
-            progress.empty()
-            st.session_state.dye_data = dye_data
-            if from_cytek:
-                st.info(
-                    f"Using Cytek's official Aurora 5L signature for {len(from_cytek)} "
-                    f"dye(s): {', '.join(from_cytek)}."
-                )
-            if reused:
-                st.info(f"Reused saved custom data for: {', '.join(reused)}.")
-            if missing:
-                st.warning(
-                    f"No spectrum available for: {', '.join(missing)}. They will be "
-                    "excluded — supply a CSV or screenshot above to include them."
-                )
-            no_curves = [n for n, e in dye_data.items() if "EM" not in e]
+if analyze:
+    if len(queries) < 2:
+        st.session_state.dye_data = {}
+        st.session_state.missing_dyes = []
+        st.session_state.analyzed_queries = queries
+        st.session_state.analyzed_cytek_only = cytek_only
+        st.error("Add at least two dyes. Overlap is a property of a pair.")
+    else:
+        dye_data, missing, reused, from_cytek = resolve_panel(
+            queries, cytek_only, bool(refresh_index) and not cytek_only
+        )
+        st.session_state.dye_data = dye_data
+        st.session_state.missing_dyes = missing
+        st.session_state.analyzed_queries = queries
+        st.session_state.analyzed_cytek_only = cytek_only
+        st.session_state.colors = sv.assign_colors(
+            list(dye_data), st.session_state.get("colors") or {}
+        )
+        st.session_state.selected_pair = None
+        if from_cytek:
+            st.toast(f"Aurora signatures for {len(from_cytek)} dyes")
+        if reused:
+            st.toast("Reused saved spectra for " + ", ".join(reused))
+        if not cytek_only:
+            no_curves = [name for name, entry in dye_data.items() if "EM" not in entry]
             if no_curves:
                 st.caption(
-                    f"Signature-only (Cytek 5L mode only, no wavelength curves): "
-                    f"{', '.join(no_curves)}."
+                    "No wavelength curve for: "
+                    + ", ".join(no_curves)
+                    + ". They stay on the Aurora plot and drop out of the wavelength views."
                 )
-            st.success(f"Spectra ready for {len(dye_data)} dyes. Go to the **Colinearity analysis** tab.")
 
-# ------------------------------------------------------------------ TAB 2 ---
-with tab2:
-    dye_data = st.session_state.dye_data
-    if not dye_data:
-        st.info("Fetch spectra in Tab 1 first.")
-    elif len(dye_data) < 2:
-        st.warning(
-            f"Only **{len(dye_data)}** dye has data ({', '.join(dye_data)}). Colinearity "
-            "is a property of *pairs*, so at least two are needed. Add more dyes in Tab 1, "
-            "or supply data for the ones that were excluded."
+dye_data = st.session_state.dye_data
+panel_sig = None
+if dye_data:
+    try:
+        panel_sig = rec.cytek_signature(dye_data)
+        if len(panel_sig) == 0:
+            panel_sig = None
+    except ValueError as exc:
+        st.error(str(exc))
+
+with status_slot:
+    if dye_data:
+        st.dataframe(
+            dye_status_frame(st.session_state.get("analyzed_queries") or queries, dye_data, panel_sig),
+            hide_index=True,
+            height=360,
         )
+
+with right_box:
+    if not dye_data:
+        analyzed_queries = st.session_state.get("analyzed_queries")
+        if not analyzed_queries:
+            st.markdown("Nothing plotted yet. Add at least two dyes and choose **Analyze panel**.")
+        elif len(analyzed_queries) < 2:
+            st.markdown("Add at least two dyes. Overlap is a property of a pair.")
+        else:
+            st.markdown("No spectra were loaded for this list. Add a signature for each dye below.")
     else:
-        st.subheader("Instrument / weighting configuration")
-        _cytek_preset = "Cytek Aurora / Northern Lights 5L (355/405/488/561/640)"
-        if st.session_state.get("cytek_only", True):
-            st.info(
-                "**Cytek Aurora 5L, 64 detector channels** — using the instrument's own "
-                "measured signatures. The other modes need wavelength curves, which "
-                "Cytek-only data doesn't carry; switch the spectral source in Tab 1 to "
-                "*Cytek + FPbase* if you want them."
-            )
-            preset_name = _cytek_preset
-        else:
-            preset_name = st.selectbox(
-                "Mode", list(LASER_PRESETS.keys()),
-                index=list(LASER_PRESETS.keys()).index(_cytek_preset),
-            )
-        preset = LASER_PRESETS[preset_name]
-
-        lasers = None
-        if preset == "custom":
-            txt = st.text_input("Laser lines, nm (comma-separated)", value="405,488,640")
-            try:
-                wavelengths = [float(x.strip()) for x in txt.split(",") if x.strip()]
-                lasers = {f"L{int(w)}": w for w in wavelengths}
-            except ValueError:
-                st.error("Could not parse laser wavelengths.")
-        elif preset is not None:
-            lasers = preset
-
-        if st.session_state.get("cytek_only", True):
-            use_cytek_channels = True
-        else:
-            use_cytek_channels = st.checkbox(
-                "Bin into Cytek Aurora 5L's actual 64 detector channels "
-                "(requires the 5L preset above)",
-                value=(preset_name.startswith("Cytek")),
-            )
-
-        # Compute automatically the first time this tab is opened for a given panel and
-        # mode. Requiring a button click here meant landing on the tab after fetching
-        # showed nothing at all, which reads as "the second tab is empty".
-        fingerprint = (tuple(sorted(dye_data)), preset_name, bool(use_cytek_channels))
-        stale = st.session_state.get("results_fingerprint") != fingerprint
-        run = st.button("Recompute", type="primary") or stale
-        if stale:
-            st.session_state.results_fingerprint = fingerprint
-
-        sig_only = [n for n, e in dye_data.items() if "SIGNATURE" in e]
-        is_cytek_mode = use_cytek_channels and preset_name.startswith("Cytek")
-        if sig_only and not is_cytek_mode:
-            st.warning(
-                f"**{', '.join(sig_only)}** was supplied as an Aurora 5L channel "
-                "signature, which has no wavelength curves behind it. It can only be "
-                "analysed in the **Cytek Aurora 5L** mode with channel binning ticked — "
-                "in this mode it will be dropped."
-            )
-
-        if run:
-            em_curves, ex_curves = col.build_curves(dye_data)
-            n_no_ex = [n for n in em_curves if n not in ex_curves]
-
-            if lasers is None:
-                pearson, cosine = col.emission_only_similarity(em_curves)
-                mode_label = "Emission-shape-only similarity"
-                extra = {}
-            elif use_cytek_channels and set(lasers.keys()) == set(LASER_PRESETS["Cytek Aurora / Northern Lights 5L (355/405/488/561/640)"].keys()):
-                # Must go through rec.cytek_signature, not col.cytek64_similarity: the
-                # latter derives everything from wavelength curves, so a dye carrying a
-                # ready-made SIGNATURE (Cytek library, or a digitised plot) contributed
-                # nothing and the matrix came out 0x0 -- a heatmap with a title and a
-                # colourbar but no cells.
-                sig_norm = rec.cytek_signature(dye_data)
-                if len(sig_norm) < 2:
-                    st.error(
-                        "Fewer than two dyes have usable data for this mode, so there are "
-                        "no pairs to compare. Check the source table in Tab 1."
-                    )
-                    st.stop()
-                cosine = rec.cosine_matrix(sig_norm)
-                pearson = pd.DataFrame(
-                    np.corrcoef(sig_norm.values),
-                    index=sig_norm.index, columns=sig_norm.index,
+        preset_name = CYTEK_PRESET
+        use_channels = True
+        custom_txt = "405, 488, 640"
+        if not st.session_state.get("analyzed_cytek_only", True):
+            with st.expander("Other instruments", icon=":material/tune:"):
+                st.caption("The Aurora channel plot stays available. These options score wavelength curves instead.")
+                preset_names = list(LASER_PRESETS)
+                preset_name = st.selectbox(
+                    "Instrument",
+                    preset_names,
+                    index=preset_names.index(CYTEK_PRESET),
+                    key="preset_name",
                 )
-                peak_channel = sig_norm.idxmax(axis=1)
-                mode_label = "Cytek Aurora 5L 64-channel signature similarity"
-                extra = {"signature": sig_norm, "peak_channel": peak_channel}
+                if preset_name.startswith("Cytek"):
+                    use_channels = st.toggle(
+                        "Use the 64 detector channels",
+                        value=True,
+                        key="use_channels",
+                    )
+                else:
+                    use_channels = False
+                if LASER_PRESETS[preset_name] == "custom":
+                    custom_txt = st.text_input(
+                        "Laser lines, nm, comma-separated",
+                        value="405, 488, 640",
+                        key="custom_laser_txt",
+                    )
+        view = compute_view(dye_data, preset_name, use_channels, custom_txt)
+        if view.get("error"):
+            st.error(view["error"])
+        else:
+            theme = _theme()
+            ink, muted, grid = theme["ink"], theme["muted"], theme["grid"]
+            cosine = view["cosine"]
+            matrix_key = (view["mode"], tuple(cosine.index))
+            if st.session_state.get("matrix_key") != matrix_key:
+                st.session_state.matrix_key = matrix_key
+                st.session_state.selected_pair = sv.top_pair(cosine)
+                st.session_state.pop("pair_table", None)
+                st.session_state.pop("pair_token", None)
+                st.session_state.pop("sim_heat_Cosine", None)
+                st.session_state.pop("sim_heat_Pearson", None)
+                for score_name in ("Cosine", "Pearson"):
+                    st.session_state.pop(f"heat_token_{score_name}", None)
+
+            with st.container(border=True):
+                st.subheader(view["label"])
+                with st.container(horizontal=True, vertical_alignment="center"):
+                    score = st.segmented_control(
+                        "Color the matrix by",
+                        ["Cosine", "Pearson"],
+                        default="Cosine",
+                        key="score_metric",
+                    )
+                    show_rest = st.toggle("Show the rest of the panel", key="show_rest")
+                if score not in ("Cosine", "Pearson"):
+                    score = "Cosine"
+                pair = st.session_state.get("selected_pair")
+                names = set(cosine.index)
+                if not pair or pair[0] not in names or pair[1] not in names:
+                    pair = sv.top_pair(cosine)
+                    st.session_state.selected_pair = pair
+                if pair is None:
+                    st.markdown("Only one dye has data. Add another dye. Overlap is a property of a pair.")
+                else:
+                    _draw_hero(view, pair, bool(show_rest), ink, muted, grid)
+                    st.markdown(_hero_caption(view, pair))
+                    st.caption(SCORE_NOTE)
+                    if view["mode"] == "cytek" and view["extra"].get("em"):
+                        st.markdown("**Emission shape**")
+                        st.caption(
+                            "The Aurora score above does not use this curve. "
+                            "Solid is emission. Dashed is excitation. "
+                            "Faint vertical lines mark the Aurora lasers."
+                        )
+                        em, ex = view["extra"]["em"], view["extra"]["ex"]
+                        dyes = [name for name in ([*pair, *cosine.index] if show_rest else pair) if name in em]
+                        # unique, pair first
+                        seen = []
+                        for name in dyes:
+                            if name not in seen:
+                                seen.append(name)
+                        missing_curves = [name for name in pair if name not in em]
+                        if missing_curves:
+                            st.caption(
+                                ", ".join(missing_curves)
+                                + " has an Aurora signature and no wavelength curve, so it is not on this plot."
+                            )
+                        wave = sv.emission_chart(em, ex, seen, st.session_state.colors, ink=ink, show_lasers=True)
+                        if wave is not None:
+                            st.altair_chart(wave, theme=None)
+                    for warning in view["warnings"]:
+                        st.warning(warning)
+
+            if pair is not None:
+                scored = view["pearson"] if score == "Pearson" else view["cosine"]
+                order = (
+                    sv.order_by_peak(view["extra"]["signature"])
+                    if view["mode"] == "cytek"
+                    else list(scored.index)
+                )
+                # Peak order only includes dyes in the signature. Fall back if a name is missing.
+                order = [name for name in order if name in scored.index]
+                if len(order) != len(scored.index):
+                    order = list(scored.index)
+                signature = view["extra"].get("signature") if view["mode"] == "cytek" else None
+                pairs = pair_frame(view["pearson"], view["cosine"], signature, pair, score)
+                scheme, domain = ("blues", (0.0, 1.0)) if score == "Cosine" else ("redblue", (-1.0, 1.0))
+                heat = sv.heatmap_chart(
+                    scored,
+                    order,
+                    pair,
+                    ink=ink,
+                    scheme=scheme,
+                    domain=domain,
+                    diag_color=theme["diag"],
+                )
+                with st.container(border=True):
+                    st.subheader("Pairs")
+                    st.caption(SCALE_NOTE)
+                    table_col, heat_col = st.columns([1, 1.15])
+                    if st.session_state.pop("_reset_pair_table", False) or st.session_state.get("score_for_table") != score:
+                        st.session_state.score_for_table = score
+                        st.session_state.pop("pair_table", None)
+                        st.session_state.pop("pair_token", None)
+                    with table_col:
+                        table_event = st.dataframe(
+                            pairs,
+                            hide_index=True,
+                            height=460,
+                            on_select="rerun",
+                            selection_mode="single-row",
+                            key="pair_table",
+                            column_config={
+                                "Cosine": st.column_config.NumberColumn(format="%.2f"),
+                                "Pearson": st.column_config.NumberColumn(format="%.2f"),
+                            },
+                        )
+                    with heat_col:
+                        heat_event = st.altair_chart(
+                            heat,
+                            on_select="rerun",
+                            key=f"sim_heat_{score}",
+                            theme=None,
+                        )
+                    heat_pair = _cell_pair(getattr(heat_event, "selection", None))
+                    table_rows = list(getattr(getattr(table_event, "selection", None), "rows", []) or [])
+                    table_pair = None
+                    if table_rows and table_rows[0] < len(pairs):
+                        chosen = pairs.iloc[table_rows[0]]
+                        table_pair = (chosen["Dye 1"], chosen["Dye 2"])
+                    rerun = False
+                    if _remember(repr(heat_pair), f"heat_token_{score}") and heat_pair:
+                        if not sv.same_pair(st.session_state.get("selected_pair"), *heat_pair):
+                            st.session_state.selected_pair = heat_pair
+                            st.session_state._reset_pair_table = True
+                            rerun = True
+                    elif _remember(repr(table_pair), "pair_token") and table_pair:
+                        if not sv.same_pair(st.session_state.get("selected_pair"), *table_pair):
+                            st.session_state.selected_pair = table_pair
+                            rerun = True
+                    if rerun:
+                        st.rerun()
+                    _downloads(view, pairs)
+
+missing = st.session_state.get("missing_dyes") or []
+if missing and dye_data is not None and st.session_state.get("analyzed_queries"):
+    st.warning("Not drawn: " + ", ".join(missing) + ". No Aurora signature.")
+    for query in missing:
+        with st.expander(f"Add a signature for {query}", icon=":material/upload:"):
+            unresolved_panel(query)
+
+if st.session_state.get("analyzed_queries"):
+    with st.expander("Replace a spectrum for a dye already in the list", icon=":material/edit:"):
+        st.caption(
+            "What you add here takes precedence over the Cytek library and over FPbase. "
+            "Choose Analyze panel again after it is saved."
+        )
+        target = st.selectbox(
+            "Dye",
+            st.session_state.analyzed_queries,
+            key="manual_target",
+        )
+        if target:
+            manual_source_ui(target, key_prefix="manual")
+
+if dye_data and not st.session_state.get("analyzed_cytek_only", True):
+    with st.expander("Wavelength names", icon=":material/manage_search:"):
+        st.caption(
+            "Confident FPbase matches are applied when you analyze. "
+            "Correct one here if a wavelength curve is the wrong dye. "
+            "The Aurora signature does not change."
+        )
+        lookup = st.session_state.get("owner_lookup") or {}
+        name_rows = []
+        for query in st.session_state.analyzed_queries:
+            entry = dye_data.get(query) or {}
+            name_rows.append(
+                {
+                    "Dye": query,
+                    "FPbase": entry.get("fpbase_name") or st.session_state.selections.get(query) or "—",
+                }
+            )
+        st.dataframe(pd.DataFrame(name_rows), hide_index=True)
+        correct = st.selectbox("Correct one", st.session_state.analyzed_queries, key="fp_correct")
+        options = fp.suggest_matches(correct, st.session_state.get("all_dye_names") or [], n=8)
+        choice = st.selectbox("FPbase entry", options + [NOT_FOUND], key=f"fp_choice_{correct}")
+        if st.button("Apply this match", key="apply_fp_match"):
+            entry = dict(dye_data.get(correct) or {})
+            if choice == NOT_FOUND or choice not in lookup:
+                for key in ("EM", "EX", "AB"):
+                    entry.pop(key, None)
+                if entry.get("fpbase_name") and not str(entry.get("fpbase_name")).startswith("(Cytek"):
+                    entry.pop("fpbase_name", None)
+                st.session_state.selections[correct] = None
             else:
-                pearson, cosine, laser_eff = col.laser_weighted_similarity(em_curves, ex_curves, lasers)
-                mode_label = f"Laser-weighted similarity ({', '.join(f'{k}={v}nm' for k, v in lasers.items())})"
-                extra = {"laser_eff": laser_eff}
+                entry.update(fp.fetch_dye_curves(choice, lookup[choice]))
+                st.session_state.selections[correct] = choice
+            if entry:
+                dye_data[correct] = entry
+            else:
+                dye_data.pop(correct, None)
+            st.session_state.dye_data = dye_data
+            st.rerun()
 
-            if n_no_ex and lasers is not None:
-                st.warning(
-                    f"No excitation data for: {', '.join(n_no_ex)} -- excluded from laser-weighted result."
-                )
-
-            st.session_state.results = dict(
-                pearson=pearson, cosine=cosine, mode_label=mode_label, extra=extra
-            )
-
-        if "results" in st.session_state:
-            res = st.session_state.results
-            pearson, cosine, mode_label, extra = res["pearson"], res["cosine"], res["mode_label"], res["extra"]
-
-            st.subheader(mode_label)
-            fig, ax = plt.subplots(figsize=(0.55 * len(pearson) + 3, 0.5 * len(pearson) + 3))
-            sns.heatmap(
-                pearson, cmap="rocket_r", vmin=-0.3, vmax=1.0, square=True,
-                linewidths=0.4, linecolor="white", annot=True, fmt=".2f",
-                annot_kws={"size": 7}, cbar_kws={"label": "Pearson r"}, ax=ax,
-            )
-            ax.set_title(mode_label, fontsize=11)
-            plt.xticks(rotation=45, ha="right", fontsize=8)
-            plt.yticks(fontsize=8)
-            plt.tight_layout()
-            st.pyplot(fig)
-
-            png_buf = io.BytesIO()
-            fig.savefig(png_buf, format="png", dpi=200)
-            st.download_button("Download heatmap PNG", png_buf.getvalue(), "colinearity_heatmap.png", "image/png")
-
-            if "peak_channel" in extra:
-                st.caption("Peak detector channel per dye:")
-                st.dataframe(extra["peak_channel"].rename("peak_channel"))
-
-            st.subheader("Ranked pairwise similarity")
-            pairs_df = col.ranked_pairs(pearson, cosine)
-            st.dataframe(pairs_df, use_container_width=True, height=350)
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.download_button(
-                    "Download pairwise CSV", pairs_df.to_csv(index=False), "pairwise_similarity_ranked.csv", "text/csv"
-                )
-            with c2:
-                st.download_button(
-                    "Download full correlation matrix CSV", pearson.to_csv(), "pearson_correlation.csv", "text/csv"
-                )
-            with c3:
-                if "signature" in extra:
-                    st.download_button(
-                        "Download 64-channel signature CSV",
-                        extra["signature"].to_csv(),
-                        "cytek64_normalized_signature.csv",
-                        "text/csv",
-                    )
-
-# ------------------------------------------------------------------ TAB 3 ---
-with tab3:
-    dye_data = st.session_state.dye_data
-    if not dye_data:
-        st.info("Fetch spectra in Tab 1 first.")
-    elif len(dye_data) < 2:
-        st.warning(
-            f"Only **{len(dye_data)}** dye has data. Swap recommendations are scored "
-            "against the rest of the panel, so at least two dyes are needed."
+st.header("Try a swap", icon=":material/swap_horiz:")
+st.warning(SWAP_WARNING, icon=":material/warning:")
+if panel_sig is None or len(panel_sig) < 2:
+    st.caption("Analyze a panel with at least two Aurora signatures to score replacements.")
+else:
+    base = rec.panel_metrics(panel_sig)
+    st.caption(
+        "Suggestions use cosine of the Aurora 5L signatures. "
+        "A replacement can lower the single closest pair and still spread overlap across more of the panel."
+    )
+    with st.container(horizontal=True):
+        st.metric(
+            "Closest pair",
+            f"{base['max']:.3f}",
+            help=" / ".join(base["worst_pair"]) if base["worst_pair"] else "Highest cosine in the panel.",
+            border=True,
         )
-    else:
-        st.subheader("Suggested swaps to reduce colinearity")
-        st.warning(
-            "**These are spectral suggestions only -- they are not panel design.** "
-            "Before acting on any of them, check that (1) the reagent actually exists "
-            "conjugated to your clone, (2) the dye's brightness suits that marker's "
-            "expression level (dim dyes on high-expression markers, bright dyes on low), "
-            "and (3) the markers involved are actually co-expressed on the same cells -- "
-            "two colinear dyes on mutually exclusive populations rarely matter. "
-            "Spectral similarity is one input to panel design, not the objective function."
+        st.metric("Pairs above 0.5", base["n_over_0.5"], border=True)
+        st.metric("Pairs above 0.4", base["n_over_0.4"], border=True)
+    slots = rec.worst_partner_per_slot(panel_sig)
+    st.caption("Closest partner for each dye.")
+    st.dataframe(
+        slots.rename(columns={
+            "dye": "Dye",
+            "worst_similarity": "Cosine",
+            "worst_partner": "Closest partner",
+            "peak_channel": "Peak",
+        }),
+        hide_index=True,
+        column_config={"Cosine": st.column_config.NumberColumn(format="%.2f")},
+    )
+    slot = st.selectbox(
+        "Which dye would you consider replacing?",
+        list(slots["dye"]),
+        key="swap_slot",
+        help="The list is closest-first.",
+    )
+    if st.session_state.get("_viability_for") != slot:
+        st.session_state._viability_for = slot
+        st.session_state.viability_slot = (
+            "zombie" in slot.lower() or "live" in slot.lower() or "viability" in slot.lower()
         )
-
-        panel_fpnames = {k: v.get("fpbase_name", k) for k, v in dye_data.items()}
-        sig = rec.cytek_signature(dye_data)
-        slots = rec.worst_partner_per_slot(sig)
-        base = rec.panel_metrics(sig)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Worst pair (cosine)", f"{base['max']:.3f}",
-                  help=" / ".join(base['worst_pair']) if base['worst_pair'] else "no pairs")
-        c2.metric("Pairs > 0.5", base["n_over_0.5"])
-        c3.metric("Pairs > 0.4", base["n_over_0.4"])
-
-        st.caption("Worst partner for each dye in the current panel:")
-        st.dataframe(slots, use_container_width=True, height=250)
-
-        st.divider()
-        slot = st.selectbox(
-            "Which dye would you consider replacing?",
-            list(slots["dye"]),
-            help="Slots are listed worst-first.",
+    with st.container(horizontal=True):
+        viability_slot = st.toggle(
+            "This is the viability dye (no antibody attached)",
+            key="viability_slot",
+            help=(
+                "Viability dyes can move anywhere in the spectrum, so the same-laser "
+                "restriction is lifted and only viability reagents are proposed."
+            ),
         )
-        cA, cB = st.columns(2)
-        with cA:
-            viability_slot = st.checkbox(
-                "This is the viability dye (no antibody attached)",
-                value=("zombie" in slot.lower() or "live" in slot.lower()
-                       or "viability" in slot.lower()),
-                help="Viability dyes can move anywhere in the spectrum, so the same-laser "
-                     "restriction is lifted and only viability reagents are proposed. "
-                     "Usually the cheapest fix in a panel.",
+        same_laser = st.toggle(
+            "Restrict to the same laser",
+            value=True,
+            key="same_laser",
+            disabled=viability_slot,
+            help="Keeps the marker's brightness tier and reagent availability plausible.",
+        )
+    if st.button(
+        "Find replacements (loads the reagent list once)",
+        type="primary",
+        icon=":material/find_replace:",
+        key="find_swaps",
+    ):
+        with st.spinner("Loading the reagent list"):
+            progress = st.progress(0.0)
+            pool = fp.fetch_candidate_pool(
+                cand_mod.ALL_CANDIDATES,
+                progress_cb=lambda frac, name: progress.progress(min(frac, 1.0), text=f"Loading {name}"),
             )
-        with cB:
-            same_laser = st.checkbox(
-                "Restrict to the same laser (like-for-like)",
-                value=True,
-                help="Keeps the marker's brightness tier and reagent availability plausible. "
-                     "Unchecking will suggest spectrally-optimal dyes that may not exist for "
-                     "your clone.",
-                disabled=viability_slot,
-            )
-
-        if st.button("Find replacement candidates", type="primary"):
-            with st.spinner("Fetching candidate reagent spectra from FPbase (cached after first run)..."):
-                prog = st.progress(0.0)
-                pool = fp.fetch_candidate_pool(
-                    cand_mod.ALL_CANDIDATES,
-                    progress_cb=lambda f, n: prog.progress(min(f, 1.0), text=f"fetching {n}"),
-                )
-                prog.empty()
-            st.session_state.rec_result = (
+            progress.empty()
+        panel_names = {key: value.get("fpbase_name", key) for key, value in dye_data.items()}
+        st.session_state.rec_result = (
+            slot,
+            rec.recommend_for_slot(
                 slot,
-                rec.recommend_for_slot(
-                    slot, dye_data, pool, panel_fpnames,
-                    same_laser_only=same_laser, viability_slot=viability_slot,
-                ),
+                dye_data,
+                pool,
+                panel_names,
+                same_laser_only=same_laser,
+                viability_slot=viability_slot,
+            ),
+        )
+        st.session_state.swap_pool_ready = True
+
+    if "rec_result" in st.session_state:
+        replaced, ranked = st.session_state.rec_result
+        st.markdown(f"**Candidates to replace {replaced}**")
+        if ranked.empty:
+            st.info("No candidate in the curated reagent pool fits those constraints. Try turning off the same-laser restriction.")
+        else:
+            show = ranked.rename(columns={
+                "slot_worst_after": "Closest cosine after",
+                "slot_improvement": "Improvement",
+                "new_worst_partner": "New closest partner",
+                "panel_max_after": "Panel closest after",
+                "panel_pairs_over_0.5": "Panel pairs above 0.5",
+                "panel_pairs_over_0.4": "Panel pairs above 0.4",
+                "peak_channel": "Peak",
+                "laser": "Laser",
+                "candidate": "Candidate",
+            })
+            if "Laser" in show.columns:
+                show["Laser"] = show["Laser"].map(lambda value: sv.LASER_NM.get(value, value))
+            st.dataframe(
+                show,
+                hide_index=True,
+                height=380,
+                column_config={
+                    "Closest cosine after": st.column_config.NumberColumn(format="%.3f"),
+                    "Improvement": st.column_config.NumberColumn(format="%.3f"),
+                    "Panel closest after": st.column_config.NumberColumn(format="%.3f"),
+                    "slot_worst_before": None,
+                },
             )
-
-        if "rec_result" in st.session_state:
-            rslot, df = st.session_state.rec_result
-            st.markdown(f"**Candidates to replace `{rslot}`**")
-            if df.empty:
+            st.caption(
+                f"Current panel: closest pair {base['max']:.3f}, "
+                f"{base['n_over_0.5']} pairs above 0.5, {base['n_over_0.4']} pairs above 0.4. "
+                "Prefer a candidate that lowers both the closest pair and the pair counts."
+            )
+            st.download_button(
+                "Download candidate ranking",
+                ranked.to_csv(index=False),
+                f"swap_candidates_{replaced.replace(' ', '_')}.csv",
+                "text/csv",
+                key="dl_swaps",
+            )
+            pick = st.selectbox(
+                f"Replace {replaced} with",
+                list(ranked["candidate"]),
+                key="swap_preview_pick",
+            )
+            pool = fp.fetch_candidate_pool(cand_mod.ALL_CANDIDATES)
+            after_entries = rec.apply_swap(dye_data, replaced, pick, pool)
+            sig_after = rec.cytek_signature(after_entries)
+            after = rec.panel_metrics(sig_after)
+            with st.container(horizontal=True):
+                st.metric(
+                    "Closest pair",
+                    f"{after['max']:.3f}",
+                    delta=f"{after['max'] - base['max']:+.3f}",
+                    delta_color="inverse",
+                    border=True,
+                    help=" / ".join(after["worst_pair"]) if after["worst_pair"] else None,
+                )
+                st.metric(
+                    "Pairs above 0.5",
+                    after["n_over_0.5"],
+                    delta=after["n_over_0.5"] - base["n_over_0.5"],
+                    delta_color="inverse",
+                    border=True,
+                )
+                st.metric(
+                    "Pairs above 0.4",
+                    after["n_over_0.4"],
+                    delta=after["n_over_0.4"] - base["n_over_0.4"],
+                    delta_color="inverse",
+                    border=True,
+                )
+            d_max = after["max"] - base["max"]
+            d_04 = after["n_over_0.4"] - base["n_over_0.4"]
+            d_05 = after["n_over_0.5"] - base["n_over_0.5"]
+            if d_max < -1e-9 and (d_04 > 0 or d_05 > 0):
+                st.warning(
+                    f"**Mixed result. Read past the headline number.** This swap lowers "
+                    f"the single closest pair ({d_max:+.3f}) but increases the number of "
+                    f"moderately similar pairs (above 0.4: {d_04:+d}, above 0.5: {d_05:+d}). "
+                    "The replacement is spreading its overlap across more of the panel "
+                    "instead of concentrating it in one pair. A swap like this usually "
+                    "makes unmixing harder overall, not easier."
+                )
+            elif d_max >= -1e-9 and d_04 >= 0 and d_05 >= 0:
                 st.info(
-                    "No candidate in the curated reagent pool fits those constraints. "
-                    "Try unchecking the same-laser restriction."
+                    "This swap does not improve the panel. The closest pair lies elsewhere, "
+                    "so changing this slot cannot move the headline number. Try the dye named "
+                    "in the closest-pair metric above."
                 )
-            else:
-                show = df.rename(columns={
-                    "slot_worst_after": "worst sim. after",
-                    "slot_improvement": "improvement",
-                    "new_worst_partner": "new worst partner",
-                    "panel_max_after": "panel max after",
-                    "panel_pairs_over_0.5": "panel pairs >0.5",
-                    "panel_pairs_over_0.4": "panel pairs >0.4",
-                })
-                st.dataframe(show, use_container_width=True, height=380)
-                st.caption(
-                    f"Current panel for reference: worst pair {base['max']:.3f}, "
-                    f"{base['n_over_0.5']} pairs >0.5, {base['n_over_0.4']} pairs >0.4. "
-                    "Prefer a candidate that lowers **both** the worst pair and the pair "
-                    "counts -- a swap that minimises the single worst pair can raise the "
-                    "number of moderately-correlated pairs and leave the panel worse overall."
-                )
-                st.download_button(
-                    "Download candidate ranking CSV",
-                    df.to_csv(index=False),
-                    f"swap_candidates_{rslot.replace(' ', '_')}.csv",
-                    "text/csv",
-                )
-
-                st.divider()
-                st.subheader("Preview a swap")
-                st.caption(
-                    "Colinearity matrices are cosine similarity of the Cytek 5L 64-channel "
-                    "signatures -- the same measure the candidate ranking above is scored on."
-                )
-                pick = st.selectbox(
-                    f"Replace `{rslot}` with:",
-                    list(df["candidate"]),
-                    index=0,
-                    key="swap_preview_pick",
-                )
-
-                pool = fp.fetch_candidate_pool(cand_mod.ALL_CANDIDATES)
-                after_entries = rec.apply_swap(dye_data, rslot, pick, pool)
-                sig_after = rec.cytek_signature(after_entries)
-                m_after = rec.panel_metrics(sig_after)
-
-                d1, d2, d3 = st.columns(3)
-                d1.metric(
-                    "Worst pair (cosine)", f"{m_after['max']:.3f}",
-                    delta=f"{m_after['max'] - base['max']:+.3f}",
-                    delta_color="inverse",
-                    help=(" / ".join(m_after['worst_pair'])
-                          if m_after['worst_pair'] else "no pairs"),
-                )
-                d2.metric(
-                    "Pairs > 0.5", m_after["n_over_0.5"],
-                    delta=m_after["n_over_0.5"] - base["n_over_0.5"],
-                    delta_color="inverse",
-                )
-                d3.metric(
-                    "Pairs > 0.4", m_after["n_over_0.4"],
-                    delta=m_after["n_over_0.4"] - base["n_over_0.4"],
-                    delta_color="inverse",
-                )
-                d_max = m_after["max"] - base["max"]
-                d_04 = m_after["n_over_0.4"] - base["n_over_0.4"]
-                d_05 = m_after["n_over_0.5"] - base["n_over_0.5"]
-                if d_max < -1e-9 and (d_04 > 0 or d_05 > 0):
-                    st.warning(
-                        f"**Mixed result -- read past the headline number.** This swap lowers "
-                        f"the single worst pair ({d_max:+.3f}) but *increases* the number of "
-                        f"moderately correlated pairs (>0.4: {d_04:+d}, >0.5: {d_05:+d}). "
-                        "The replacement is spreading its overlap across more of the panel "
-                        "instead of concentrating it in one pair. A swap like this usually "
-                        "makes unmixing harder overall, not easier."
-                    )
-                elif d_max >= -1e-9 and d_04 >= 0 and d_05 >= 0:
-                    st.info(
-                        "This swap does not improve the panel -- the worst pair lies elsewhere, "
-                        "so changing this slot cannot move the headline number. Try the slot "
-                        "named in the worst-pair metric above."
-                    )
-
-                cos_before = rec.cosine_matrix(sig)
+            partner = slots.loc[slots["dye"] == replaced, "worst_partner"]
+            partner_name = str(partner.iloc[0]) if len(partner) else ""
+            new_partner = str(ranked.loc[ranked["candidate"] == pick, "new_worst_partner"].iloc[0])
+            _swap_overlay(panel_sig, replaced, pick, partner_name, new_partner, pool)
+            with st.expander("Matrix before and after"):
+                order_before = sv.order_by_peak(panel_sig)
+                order_after = [pick if name == replaced else name for name in order_before]
+                cos_before = rec.cosine_matrix(panel_sig)
                 cos_after = rec.cosine_matrix(sig_after)
-                lab_before = [rec.short_label(n) for n in cos_before.index]
-                lab_after = [rec.short_label(n) for n in cos_after.index]
-
-                fig3, axes3 = plt.subplots(
-                    1, 2, figsize=(2 * (0.5 * len(cos_before) + 3), 0.5 * len(cos_before) + 3)
+                theme = _theme()
+                before_chart = sv.heatmap_chart(
+                    cos_before, order_before, None, selectable=False,
+                    ink=theme["ink"], diag_color=theme["diag"],
                 )
-                for ax, mat, labs, ttl in zip(
-                    axes3,
-                    [cos_before, cos_after],
-                    [lab_before, lab_after],
-                    [f"Before  (worst {base['max']:.3f})",
-                     f"After: {rslot} → {pick}  (worst {m_after['max']:.3f})"],
-                ):
-                    sns.heatmap(
-                        mat, cmap="rocket_r", vmin=0.0, vmax=1.0, square=True,
-                        linewidths=0.4, linecolor="white", annot=True, fmt=".2f",
-                        annot_kws={"size": 6}, cbar_kws={"label": "cosine similarity"},
-                        xticklabels=labs, yticklabels=labs, ax=ax,
-                    )
-                    ax.set_title(ttl, fontsize=10)
-                    ax.tick_params(axis="x", rotation=45, labelsize=7)
-                    ax.tick_params(axis="y", rotation=0, labelsize=7)
-                    for lbl in ax.get_xticklabels():
-                        lbl.set_ha("right")
-                    # outline the row/column of the dye that changed
-                    if labs is lab_after:
-                        k = list(cos_after.index).index(pick)
-                        for rect in (
-                            plt.Rectangle((k, 0), 1, len(cos_after), fill=False, ec="#1f77b4", lw=2),
-                            plt.Rectangle((0, k), len(cos_after), 1, fill=False, ec="#1f77b4", lw=2),
-                        ):
-                            ax.add_patch(rect)
-                plt.tight_layout()
-                st.pyplot(fig3)
-
-                buf3 = io.BytesIO()
-                fig3.savefig(buf3, format="png", dpi=200)
-                e1, e2 = st.columns(2)
-                with e1:
-                    st.download_button(
-                        "Download before/after heatmap PNG",
-                        buf3.getvalue(),
-                        f"swap_{rslot.replace(' ', '_')}_to_{pick.replace(' ', '_')}.png",
-                        "image/png",
-                    )
-                with e2:
-                    st.download_button(
-                        "Download post-swap matrix CSV",
-                        cos_after.to_csv(),
-                        f"cosine_after_swap_{pick.replace(' ', '_')}.csv",
-                        "text/csv",
-                    )
+                after_chart = sv.heatmap_chart(
+                    cos_after,
+                    [name for name in order_after if name in cos_after.index],
+                    None,
+                    selectable=False,
+                    ink=theme["ink"],
+                    diag_color=theme["diag"],
+                )
+                before_col, after_col = st.columns(2)
+                with before_col:
+                    st.caption(f"Before, closest {base['max']:.3f}")
+                    st.altair_chart(before_chart, theme=None)
+                with after_col:
+                    st.caption(f"After, {replaced} to {pick}, closest {after['max']:.3f}")
+                    st.altair_chart(after_chart, theme=None)
+                st.download_button(
+                    "Download post-swap matrix",
+                    cos_after.to_csv(),
+                    f"cosine_after_swap_{pick.replace(' ', '_')}.csv",
+                    "text/csv",
+                    key="dl_after",
+                )

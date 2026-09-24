@@ -17,7 +17,6 @@ for _ in 1 2 3 4; do
     [ -f "$APP_DIR/run_app.py" ] && break
     APP_DIR="$(dirname "$APP_DIR")"
 done
-PY="/usr/bin/python3"
 PORT_START=8600
 PORT_END=8620
 PIDFILE="$APP_DIR/.server.pid"
@@ -28,30 +27,28 @@ die() {  # show a real dialog -- a .app has no console to print to
     exit 1
 }
 
-[ -x "$PY" ] || die "Python 3 not found at $PY. Install Xcode Command Line Tools:  xcode-select --install"
 [ -f "$APP_DIR/run_app.py" ] || die "App files not found at $APP_DIR."
 
-# /usr/bin/python3 is a universal binary, and a child process inherits its parent's
-# architecture. Launched from something running under Rosetta it comes up as x86_64,
-# and then the arm64 numpy/pandas wheels fail to load with a misleading
-# "do not import numpy from its source directory" error. Pin it to native.
-#
-# Detect the *hardware*, not the current process: under Rosetta `uname -m` reports
-# x86_64, so testing that skipped the pinning in exactly the case that needs it.
-# hw.optional.arm64 is 1 on Apple Silicon however this script happens to be running.
-ARCH=""
-if [ -x /usr/bin/arch ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
-    ARCH="/usr/bin/arch -arm64"
+# Dependencies come from uv.lock. uv creates .venv on first sync, so this
+# launcher does not call system pip. Homebrew Python is PEP 668-locked.
+find_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        command -v uv
+        return
+    fi
+    for candidate in "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return
+        fi
+    done
+}
+UV="$(find_uv)"
+[ -n "$UV" ] || die "uv is not installed. Install it from https://docs.astral.sh/uv/ and open the app again."
+
+if ! (cd "$APP_DIR" && "$UV" sync --frozen); then
+    die "uv sync failed. Open Terminal in the repo folder and run:  uv sync"
 fi
-
-$ARCH "$PY" -c "import streamlit, numpy, pandas" >/dev/null 2>&1 || die \
-"Python dependencies are missing or unusable for $PY.
-
-Open Terminal and run:
-    $PY -m pip install --user streamlit numpy pandas matplotlib seaborn scipy pillow
-
-Details:
-$($ARCH "$PY" -c 'import streamlit, numpy, pandas' 2>&1 | tail -n 4)"
 
 open_browser() { /usr/bin/open "http://localhost:$1" >/dev/null 2>&1; }
 
@@ -73,7 +70,7 @@ for p in $(seq $PORT_START $PORT_END); do
 done
 [ -n "$PORT" ] || die "No free port between $PORT_START and $PORT_END."
 
-PORT="$PORT" $ARCH "$PY" "$APP_DIR/run_app.py" >"$LOG" 2>&1 &
+(cd "$APP_DIR" && exec env PORT="$PORT" "$UV" run --no-sync python run_app.py) >"$LOG" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID:$PORT" > "$PIDFILE"
 

@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Downloaded / regenerable caches -- rebuilt automatically on first run
 cache/
